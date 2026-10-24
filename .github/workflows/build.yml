@@ -101,8 +101,10 @@ jobs:
 
           cd "$KSRC"
           # BakaSU 的内核驱动在仓库 kernel/ 目录；drivers/kernelsu 指向它
+          #   注意：相对路径是 ../KernelSU/kernel（KernelSU 已克隆到 $KSRC 里面）
           rm -rf drivers/kernelsu
-          ln -sfn ../../KernelSU/kernel drivers/kernelsu
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig || { echo "::error::drivers/kernelsu 软链无效"; exit 1; }
 
           # drivers/Makefile
           grep -q 'kernelsu/' drivers/Makefile \
