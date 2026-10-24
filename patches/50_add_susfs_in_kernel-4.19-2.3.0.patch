@@ -1702,7 +1702,7 @@ diff --git a/fs/readdir.c b/fs/readdir.c
 diff --git a/fs/stat.c b/fs/stat.c
 --- a/fs/stat.c
 +++ b/fs/stat.c
-@@ -20,6 +20,29 @@
+@@ -20,6 +20,25 @@
  
  #include <linux/uaccess.h>
  #include <asm/unistd.h>
@@ -1722,17 +1722,13 @@ diff --git a/fs/stat.c b/fs/stat.c
 +extern struct static_key_true ksu_su_compat_enabled;
 +extern bool __ksu_is_allow_uid_for_current(uid_t uid);
 +extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
-+extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
-+#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
-+extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
-+#endif
 +extern int filename_lookup(int dfd, struct filename *name, unsigned flags,
 +			   struct path *path, struct path *root);
 +#endif // #ifdef CONFIG_KSU_SUSFS
  
  /**
   * generic_fillattr - Fill in the basic attributes from the inode struct
-@@ -70,16 +93,45 @@
+@@ -70,16 +89,45 @@
  		      u32 request_mask, unsigned int query_flags)
  {
  	struct inode *inode = d_backing_inode(path->dentry);
@@ -1778,7 +1774,7 @@ diff --git a/fs/stat.c b/fs/stat.c
  	return 0;
  }
  EXPORT_SYMBOL(vfs_getattr_nosec);
-@@ -169,6 +221,9 @@
+@@ -169,6 +217,9 @@
  	struct path path;
  	int error = -EINVAL;
  	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
@@ -1788,7 +1784,7 @@ diff --git a/fs/stat.c b/fs/stat.c
  
  	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
  		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
-@@ -182,7 +237,23 @@
+@@ -182,7 +233,23 @@
  		lookup_flags |= LOOKUP_EMPTY;
  
  retry:
@@ -1812,7 +1808,7 @@ diff --git a/fs/stat.c b/fs/stat.c
  	if (error)
  		goto out;
  
-@@ -272,6 +343,10 @@
+@@ -272,6 +339,10 @@
  	struct kstat stat;
  	int error = vfs_fstat(fd, &stat);
  
@@ -1823,7 +1819,7 @@ diff --git a/fs/stat.c b/fs/stat.c
  	if (!error)
  		error = cp_old_stat(&stat, statbuf);
  
-@@ -373,8 +448,16 @@
+@@ -373,6 +444,10 @@
  	struct kstat stat;
  	int error = vfs_fstat(fd, &stat);
  
@@ -1833,14 +1829,8 @@ diff --git a/fs/stat.c b/fs/stat.c
 +#endif
  	if (!error)
  		error = cp_new_stat(&stat, statbuf);
-+#ifdef CONFIG_KSU_SUSFS
-+	if (!error)
-+		ksu_handle_newfstat_ret(&fd, &statbuf);
-+#endif
  
- 	return error;
- }
-@@ -499,8 +582,16 @@
+@@ -499,6 +574,10 @@
  	struct kstat stat;
  	int error = vfs_fstat(fd, &stat);
  
@@ -1850,13 +1840,7 @@ diff --git a/fs/stat.c b/fs/stat.c
 +#endif
  	if (!error)
  		error = cp_new_stat64(&stat, statbuf);
-+#ifdef CONFIG_KSU_SUSFS
-+	if (!error)
-+		ksu_handle_fstat64_ret(&fd, &statbuf);
-+#endif
  
- 	return error;
- }
 diff --git a/fs/statfs.c b/fs/statfs.c
 --- a/fs/statfs.c
 +++ b/fs/statfs.c
