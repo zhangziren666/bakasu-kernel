@@ -118,7 +118,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  #include <linux/build_bug.h>
  
  #include "internal.h"
-@@ -47,6 +50,13 @@
+@@ -47,6 +50,14 @@
  #define CREATE_TRACE_POINTS
  #include <trace/events/namei.h>
  
@@ -128,11 +128,12 @@ diff --git a/fs/namei.c b/fs/namei.c
 +#endif
 +#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 +extern struct filename *susfs_open_redirect_spoof_do_sys_openat(struct inode *inode);
++extern int susfs_open_redirect_spoof_vfs_readlink(struct inode *inode, char __user *buffer, int buflen);
 +#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
  /* [Feb-1997 T. Schoebel-Theuer]
   * Fundamental changes in the pathname lookup mechanisms (namei)
   * were necessary because of omirr.  The reason is that omirr needs
-@@ -506,6 +516,9 @@
+@@ -506,6 +517,9 @@
  	struct path	root;
  	struct inode	*inode; /* path.dentry.d_inode */
  	unsigned int	flags;
@@ -142,7 +143,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  	unsigned	seq, m_seq;
  	int		last_type;
  	unsigned	depth;
-@@ -532,6 +545,9 @@
+@@ -532,6 +546,9 @@
  	p->total_link_count = old ? old->total_link_count : 0;
  	p->saved = old;
  	current->nameidata = p;
@@ -152,7 +153,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  }
  
  static void restore_nameidata(void)
-@@ -1610,6 +1626,14 @@
+@@ -1610,6 +1627,14 @@
  			return ERR_PTR(error);
  		}
  	}
@@ -167,7 +168,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  	return dentry;
  }
  
-@@ -1653,6 +1677,9 @@
+@@ -1653,6 +1678,9 @@
  	struct vfsmount *mnt = nd->path.mnt;
  	struct dentry *dentry, *parent = nd->path.dentry;
  	int status = 1;
@@ -177,7 +178,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  	int err;
  
  	/*
-@@ -1664,6 +1691,16 @@
+@@ -1664,6 +1692,16 @@
  		unsigned seq;
  		bool negative;
  		dentry = __d_lookup_rcu(parent, &nd->last, &seq);
@@ -194,7 +195,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  		if (unlikely(!dentry)) {
  			if (unlazy_walk(nd))
  				return -ECHILD;
-@@ -1710,6 +1747,16 @@
+@@ -1710,6 +1748,16 @@
  			status = d_revalidate(dentry, nd->flags);
  	} else {
  		dentry = __d_lookup(parent, &nd->last);
@@ -211,7 +212,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  		if (unlikely(!dentry))
  			return 0;
  		status = d_revalidate(dentry, nd->flags);
-@@ -1906,11 +1953,20 @@
+@@ -1906,11 +1954,20 @@
  					  nd->flags);
  		if (IS_ERR(path.dentry))
  			return PTR_ERR(path.dentry);
@@ -232,7 +233,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  
  		if (unlikely(d_is_negative(path.dentry))) {
  			path_to_nameidata(&path, nd);
-@@ -2238,6 +2294,17 @@
+@@ -2238,6 +2295,17 @@
  		if (err < 0)
  			return err;
  
@@ -250,7 +251,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  		if (err) {
  			const char *s = get_link(nd);
  
-@@ -2361,6 +2428,10 @@
+@@ -2361,6 +2429,10 @@
  
  static inline int lookup_last(struct nameidata *nd)
  {
@@ -261,7 +262,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  	if (nd->last_type == LAST_NORM && nd->last.name[nd->last.len])
  		nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
  
-@@ -2428,7 +2499,7 @@
+@@ -2428,7 +2500,7 @@
  	return err;
  }
  
@@ -270,7 +271,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  			   struct path *path, struct path *root)
  {
  	int retval;
-@@ -3389,6 +3460,9 @@
+@@ -3389,6 +3461,9 @@
  
  	nd->flags &= ~LOOKUP_PARENT;
  	nd->flags |= op->intent;
@@ -280,7 +281,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  
  	if (nd->last_type != LAST_NORM) {
  		error = handle_dots(nd, nd->last_type);
-@@ -3595,9 +3669,30 @@
+@@ -3595,9 +3670,30 @@
  		const struct open_flags *op,
  		struct file *file)
  {
@@ -311,7 +312,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  	if (unlikely(error))
  		return error;
  	error = mnt_want_write(path.mnt);
-@@ -3638,6 +3733,11 @@
+@@ -3638,6 +3734,11 @@
  static struct file *path_openat(struct nameidata *nd,
  			const struct open_flags *op, unsigned flags)
  {
@@ -323,7 +324,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  	struct file *file;
  	int error;
  
-@@ -3656,8 +3756,51 @@
+@@ -3656,8 +3757,51 @@
  			nd->flags &= ~(LOOKUP_OPEN|LOOKUP_CREATE|LOOKUP_EXCL);
  			s = trailing_symlink(nd);
  		}
@@ -375,7 +376,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  	if (likely(!error)) {
  		if (likely(file->f_mode & FMODE_OPENED))
  			return file;
-@@ -4902,6 +5045,15 @@
+@@ -4902,6 +5046,15 @@
  		if (IS_ERR(link))
  			return PTR_ERR(link);
  	}
@@ -391,7 +392,7 @@ diff --git a/fs/namei.c b/fs/namei.c
  	res = readlink_copy(buffer, buflen, link);
  	do_delayed_call(&done);
  	return res;
-@@ -4980,6 +5132,9 @@
+@@ -4980,6 +5133,9 @@
  }
  EXPORT_SYMBOL(page_readlink);
  
