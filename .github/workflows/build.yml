@@ -179,22 +179,38 @@ jobs:
           make_shim hex.h       '<linux/kernel.h>'  _LINUX_HEX_COMPAT_H
           make_shim unaligned.h '<asm/unaligned.h>' _LINUX_UNALIGNED_COMPAT_H
 
-      - name: Apply performance / compatibility defconfig fragment
+      # ------------------------------------------------------------------
+      # 关键：以「原厂 .config」为唯一基线
+      #   原因：CONFIG_MODVERSIONS=y 时，内核每个导出符号的 CRC 由「源码 + 配置」
+      #   共同决定。上一版用 bengal-perf_defconfig + 大量关闭调试/OPPO 特性，
+      #   改变了 struct 布局（如 CONFIG_SCHEDSTATS 影响 struct task_struct），
+      #   导致 __kcrctab 与原厂大面积不符 → vendor 的 qca_cld3_wlan.ko 因
+      #   "disagrees about version of symbol" 拒载 → WiFi 打不开。
+      #   现在只在这份原厂配置上追加 KSU/SUSFS 必需项，其余一律不动。
+      # ------------------------------------------------------------------
+      - name: Install factory (stock) kernel config
+        run: |
+          set -e
+          mkdir -p "$OUT"
+          CFG="$GITHUB_WORKSPACE/configs/stock_bengal-perf.config"
+          test -f "$CFG" || { echo "::error::缺少 configs/stock_bengal-perf.config（原厂 .config）"; exit 1; }
+          cp "$CFG" "$OUT/.config"
+          cp "$CFG" "$OUT/.config.baseline"
+          echo "原厂配置行数: $(wc -l < "$OUT/.config")"
+          grep -E '^CONFIG_(LOCALVERSION|MODVERSIONS|MODULE_SIG_FORCE|WLAN|CFG80211|ICNSS|CNSS_GENL|WCNSS_MEM_PRE_ALLOC)=' "$OUT/.config" || true
+
+      - name: Append BakaSU / SUSFS config on factory baseline
         env:
           FRAGMENT: |
             # ==================================================================
-            # 由 CI 追加：BakaSU + SUSFS 2.3.0 集成 + 性能/兼容性调优
-            # Kconfig 规则：后面追加的条目会覆盖前面的
+            # 仅追加 BakaSU + SUSFS 必需项；其余全部沿用原厂 .config
             # ==================================================================
-
-            # --- BakaSU v4.2.0-rc3（SUSFS 内联 hook 模式，4.19 非 GKI）---
             CONFIG_KSU=y
             CONFIG_KSU_SUSFS=y
             CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
             CONFIG_KALLSYMS=y
             CONFIG_KALLSYMS_ALL=y
 
-            # --- SUSFS 子功能 ---
             CONFIG_KSU_SUSFS_SUS_PATH=y
             CONFIG_KSU_SUSFS_SUS_MOUNT=y
             CONFIG_KSU_SUSFS_SUS_KSTAT=y
@@ -205,37 +221,18 @@ jobs:
             CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             CONFIG_KSU_SUSFS_SUS_MAP=y
 
-            # --- 兼容性：重编内核会更换模块签名公钥，vendor 分区预置 .ko 会拒载 ---
+            # 原厂是强制签名(MODULE_SIG_FORCE=y)：自编内核没有 OPPO 私钥，
+            # 必须关掉强制校验，否则 vendor 分区所有 .ko 都会被拒载。
+            # 只关 FORCE，MODVERSIONS 与 vermagic 保持原样。
             # CONFIG_MODULE_SIG_FORCE is not set
 
-            # --- 编译期优化：vmlinux 更小、编译更快 ---
+            # 仅减少编译时间/体积，不影响结构体布局与符号 CRC
             # CONFIG_DEBUG_INFO is not set
-
-            # --- 运行期开销裁剪 ---
-            # CONFIG_PAGE_OWNER is not set
-            # CONFIG_SCHEDSTATS is not set
-            # CONFIG_DEBUG_LIST is not set
-            # CONFIG_SLUB_DEBUG is not set
-            # CONFIG_KMALLOC_DEBUG is not set
-            # CONFIG_VMALLOC_DEBUG is not set
-            # CONFIG_DUMP_TASKS_MEM is not set
-
-            # --- 网络栈：BBR 拥塞控制 + fq 队列调度 ---
-            CONFIG_TCP_CONG_BBR=y
-            CONFIG_NET_SCH_FQ=y
-            CONFIG_DEFAULT_BBR=y
-
-            # --- 存储：zram 去重 + 快速压缩算法（原 defconfig 已开启，此处重申意图）---
-            CONFIG_ZRAM=y
-            CONFIG_ZRAM_DEDUP=y
-            CONFIG_CRYPTO_ZSTD=y
-            CONFIG_CRYPTO_LZ4=y
         run: |
           set -e
-          DEFCONFIG="$KSRC/arch/arm64/configs/vendor/bengal-perf_defconfig"
-          printf '\n%s\n' "$FRAGMENT" >> "$DEFCONFIG"
-          echo "--- fragment tail ---"
-          tail -n 45 "$DEFCONFIG"
+          printf '\n%s\n' "$FRAGMENT" >> "$OUT/.config"
+          echo "--- appended tail ---"
+          tail -n 22 "$OUT/.config"
 
       - name: Configure kernel
         run: |
@@ -247,16 +244,25 @@ jobs:
             CROSS_COMPILE=aarch64-linux-android-
             CROSS_COMPILE_ARM32=arm-linux-androideabi-
           )
-          make "${MAKE_ARGS[@]}" vendor/bengal-perf_defconfig
           make "${MAKE_ARGS[@]}" olddefconfig
+          echo "--- 与原厂配置的差异（正常应只剩 KSU/SUSFS + MODULE_SIG_FORCE + DEBUG_INFO）---"
+          diff -u "$OUT/.config.baseline" "$OUT/.config" > "$OUT/config_diff.txt" || true
+          echo "差异行数: $(wc -l < "$OUT/config_diff.txt")"
+          grep -E '^[+-]CONFIG_' "$OUT/config_diff.txt" | head -n 120 || true
           echo "--- key configs ---"
-          grep -E '^CONFIG_(KSU|THREAD_INFO_IN_TASK|OVERLAY_FS|KALLSYMS|KALLSYMS_ALL|EXT4_FS|MODULE_SIG_FORCE|DEBUG_INFO|PAGE_OWNER|TCP_CONG_BBR|NET_SCH_FQ|DEFAULT_BBR)=' "$OUT/.config" || true
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|THREAD_INFO_IN_TASK|OVERLAY_FS|KALLSYMS|KALLSYMS_ALL|EXT4_FS|MODVERSIONS|MODULE_SIG_FORCE|DEBUG_INFO|WLAN|CFG80211|ICNSS|CNSS_GENL)=' "$OUT/.config" || true
           grep -q '^CONFIG_KSU=y'              "$OUT/.config" || { echo "::error::CONFIG_KSU 未生效，BakaSU 集成失败"; exit 1; }
           grep -q '^CONFIG_KSU_SUSFS=y'        "$OUT/.config" || { echo "::error::CONFIG_KSU_SUSFS 未生效（需 THREAD_INFO_IN_TASK && 64BIT）"; exit 1; }
           grep -q '^CONFIG_THREAD_INFO_IN_TASK=y' "$OUT/.config" || { echo "::error::THREAD_INFO_IN_TASK 未开启，SUSFS 无法编译"; exit 1; }
           grep -q '^CONFIG_KALLSYMS_ALL=y'     "$OUT/.config" || { echo "::error::CONFIG_KALLSYMS_ALL 未生效"; exit 1; }
           grep -q '^CONFIG_OVERLAY_FS=y'       "$OUT/.config" || { echo "::error::CONFIG_OVERLAY_FS 未生效，KSU 依赖它"; exit 1; }
           grep -q '^CONFIG_EXT4_FS=y'          "$OUT/.config" || { echo "::error::CONFIG_EXT4_FS 未生效"; exit 1; }
+          # WiFi 依赖的原厂配置不得被改动
+          grep -q '^CONFIG_WLAN=y'             "$OUT/.config" || { echo "::error::CONFIG_WLAN 被改动，vendor wlan.ko 无法加载"; exit 1; }
+          grep -q '^CONFIG_CFG80211=y'         "$OUT/.config" || { echo "::error::CONFIG_CFG80211 被改动，vendor wlan.ko 无法加载"; exit 1; }
+          grep -q '^CONFIG_ICNSS=y'            "$OUT/.config" || { echo "::error::CONFIG_ICNSS 被改动，vendor wlan.ko 无法加载"; exit 1; }
+          grep -q '^CONFIG_CNSS_GENL=y'        "$OUT/.config" || { echo "::error::CONFIG_CNSS_GENL 被改动"; exit 1; }
+          grep -q '^CONFIG_MODVERSIONS=y'      "$OUT/.config" || { echo "::error::CONFIG_MODVERSIONS 被改动，vermagic 会与 vendor 模块不匹配"; exit 1; }
 
       - name: Build Image.gz
         run: |
@@ -270,6 +276,8 @@ jobs:
           ls -l "$OUT/arch/arm64/boot/Image.gz" "$OUT/vmlinux" "$OUT/System.map"
           echo "--- kernel release ---"
           strings "$OUT/vmlinux" | grep -m1 'Linux version' || true
+          echo "--- vermagic (必须与原厂一致: 4.19.152-perf+ SMP preempt mod_unload modversions aarch64) ---"
+          strings "$OUT/vmlinux" | grep -m1 '^4\.19\.152-perf+' || true
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
@@ -279,4 +287,6 @@ jobs:
             out/arch/arm64/boot/Image.gz
             out/vmlinux
             out/System.map
+            out/.config
+            out/config_diff.txt
           if-no-files-found: error
