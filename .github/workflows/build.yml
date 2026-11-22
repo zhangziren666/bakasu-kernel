@@ -176,6 +176,27 @@ jobs:
               print('added extern filename_lookup to', p)
           PY
 
+          # OPPO 4.19 的 inotify_fdinfo 在 `if (inode) {` 后紧跟一个局部变量声明
+          # （u32 mask = mark->mask & IN_ALL_EVENTS;），而 SUSFS 补丁把 orig_flow:
+          # 标签插到了它前面。C 语言不允许「标签后面直接跟声明」，Clang 会报
+          # expected expression / use of undeclared identifier 'mask'。
+          # 在标签后补一个空语句即可，语义不变（标签仍在声明之前，goto 过来后
+          # mask 仍会被正常初始化）。
+          python3 - <<'PY'
+          p = 'fs/notify/fdinfo.c'
+          s = open(p, encoding='utf-8').read()
+          old = 'orig_flow:\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT'
+          new = 'orig_flow:\n\t\t\t\t;\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT'
+          if 'orig_flow:\n\t\t\t\t;' in s:
+              print('orig_flow 空语句已存在，跳过')
+          elif old in s:
+              s = s.replace(old, new, 1)
+              open(p, 'w', encoding='utf-8').write(s)
+              print('已在 fs/notify/fdinfo.c 的 orig_flow 标签后补空语句')
+          else:
+              print('警告：未找到 orig_flow 标签模式')
+          PY
+
           echo "--- 校验 hook 是否全部落地 ---"
           for sym in ksu_handle_execveat ksu_handle_execveat_sucompat ksu_handle_post_execveat_sucompat \
                      ksu_handle_faccessat ksu_handle_stat ksu_handle_vfs_fstat ksu_handle_setresuid \
