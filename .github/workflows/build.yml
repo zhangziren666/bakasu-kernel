@@ -197,14 +197,47 @@ jobs:
               print('警告：未找到 orig_flow 标签模式')
           PY
 
+          # kernel/sys.c 的 setresuid hook 在脚本里有前置条件
+          # （grep drivers/kernelsu/ 里有没有 ksu_handle_setresuid），
+          # 但本流程是先装 hook、后复制 KSU 源码，脚本会直接 Skipped。
+          # 没有它，管理器进程 setresuid 时拿不到 [ksu_driver] fd，管理器就会
+          # 一直显示「未检测到 SukiSU 内核」。这里显式补上。
+          python3 - <<'PY'
+          p = 'kernel/sys.c'
+          s = open(p, encoding='utf-8').read()
+          if 'ksu_handle_setresuid' in s:
+              print('kernel/sys.c 已有 ksu_handle_setresuid，跳过')
+          else:
+              anchor = 'SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)'
+              assert anchor in s, 'kernel/sys.c: setresuid syscall anchor not found'
+              decl = ('#ifdef CONFIG_KSU\n'
+                      'extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n'
+                      '#endif\n')
+              s = s.replace(anchor, decl + anchor, 1)
+              ret = '\treturn __sys_setresuid(ruid, euid, suid);'
+              assert ret in s, 'kernel/sys.c: __sys_setresuid return anchor not found'
+              call = ('#ifdef CONFIG_KSU_SUSFS\n'
+                      '\tif (ksu_handle_setresuid(ruid, euid, suid))\n'
+                      '\t\tpr_info("Something wrong with ksu_handle_setresuid()\\n");\n'
+                      '#endif\n')
+              s = s.replace(ret, call + ret, 1)
+              open(p, 'w', encoding='utf-8').write(s)
+              print('已在 kernel/sys.c 注入 ksu_handle_setresuid hook')
+          PY
+          grep -n -B2 -A6 'ksu_handle_setresuid' kernel/sys.c
+
           echo "--- 校验 hook 是否全部落地 ---"
           for sym in ksu_handle_execveat ksu_handle_execveat_sucompat ksu_handle_post_execveat_sucompat \
-                     ksu_handle_faccessat ksu_handle_stat ksu_handle_vfs_fstat ksu_handle_setresuid \
+                     ksu_handle_faccessat ksu_handle_stat ksu_handle_vfs_fstat \
                      ksu_handle_input_handle_event ksu_handle_sys_read ksu_handle_sys_reboot; do
             c=$(grep -R --include='*.c' -h "$sym" fs kernel drivers security 2>/dev/null | wc -l)
             echo "$sym -> $c"
             [ "$c" -gt 0 ] || { echo "::error::inline hook $sym 未安装"; exit 1; }
           done
+          # 注释/字符串也会被 grep 命中，所以对 sys.c 单独做精确校验（声明 + 调用至少 2 处）
+          n=$(grep -c 'ksu_handle_setresuid' kernel/sys.c || true)
+          echo "kernel/sys.c ksu_handle_setresuid -> $n"
+          [ "$n" -ge 2 ] || { echo "::error::kernel/sys.c 缺少 setresuid hook"; exit 1; }
           grep -q 'ksu_hide_setprocattr' security/selinux/hooks.c \
             && { echo "::error::ksu_hide_setprocattr 仍残留在 hooks.c"; exit 1; } || true
           echo "--- selinux hooks.c: setprocattr / bprm ---"
@@ -256,6 +289,37 @@ jobs:
           print('KSU_CAN_USE_KPM gate -> 4.4')
           PY
           grep -n -A1 'KSU_CAN_USE_KPM' drivers/kernelsu/kernel_compat.h | head -n 6
+
+          # 管理器 UID 只有在 track_throne() 跑过之后才会被 crown。
+          # 正常路径是 ksud 上报 EVENT_BOOT_COMPLETED 或 packages.list 被重写
+          # （安装/更新应用）时触发；如果本机没有可用的 ksud，开机后就没有
+          # 任何触发点，管理器永远拿不到 fd。这里在 init 后 60s 主动补一次扫描，
+          # 让「重启后管理器不被识别」不再依赖 ksud。
+          python3 - <<'PY'
+          p = 'drivers/kernelsu/ksu.c'
+          s = open(p, encoding='utf-8').read()
+          if 'ksu_boot_throne_workfn' in s:
+              print('ksu.c 已有 boot throne 扫描，跳过')
+          else:
+              anchor = 'static char *spoof_version = NULL;'
+              assert anchor in s, 'ksu.c: spoof_version anchor not found'
+              block = ('#include <linux/jiffies.h>\n'
+                       'static void ksu_boot_throne_workfn(struct work_struct *work)\n'
+                       '{\n'
+                       '\ttrack_throne(false);\n'
+                       '}\n'
+                       'static DECLARE_DELAYED_WORK(ksu_boot_throne_work, ksu_boot_throne_workfn);\n\n')
+              s = s.replace(anchor, block + anchor, 1)
+              ret = '\tksu_lsm_hook_init();\n\treturn 0;'
+              assert ret in s, 'ksu.c: kernelsu_init return anchor not found'
+              sched = ('\tksu_lsm_hook_init();\n'
+                       '\tschedule_delayed_work(&ksu_boot_throne_work, msecs_to_jiffies(60000));\n'
+                       '\treturn 0;')
+              s = s.replace(ret, sched, 1)
+              open(p, 'w', encoding='utf-8').write(s)
+              print('已在 ksu.c 注入开机 60s throne 扫描')
+          PY
+          grep -n 'ksu_boot_throne_work' drivers/kernelsu/ksu.c
 
           # drivers/Makefile
           grep -q 'kernelsu/' drivers/Makefile \
