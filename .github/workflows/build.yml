@@ -217,8 +217,11 @@ jobs:
             || { echo "::error::Makefile 不是 builtin-new 版本"; exit 1; }
           grep -q 'config KSU_SUSFS' drivers/kernelsu/Kconfig \
             || { echo "::error::Kconfig 缺少 KSU_SUSFS"; exit 1; }
-          grep -q '947ae944f3de4ed4c21a7e4f7953ecf351bfa2b36239da37a34111ad29993eef' drivers/kernelsu/manager/apk_sign.c \
-            || { echo "::error::apk_sign.c 未内置 Nova 管理器签名"; exit 1; }
+          # Nova 官方管理器签名哈希定义在 kernel/Makefile 的 KSU_EXPECTED_HASH（-D 传给 apk_sign.c）
+          grep -q '947ae944f3de4ed4c21a7e4f7953ecf351bfa2b36239da37a34111ad29993eef' drivers/kernelsu/Makefile \
+            || { echo "::error::Makefile 未内置 Nova 管理器签名哈希"; exit 1; }
+          grep -q 'EXPECTED_HASH' drivers/kernelsu/manager/apk_sign.c \
+            || { echo "::error::apk_sign.c 未引用 EXPECTED_HASH"; exit 1; }
 
           # KPM 源码本身兼容 4.19（access_ok/thread_pid 都按版本处理），
           # 只是 kernel_compat.h 把可用门槛写死成 5.10+，这里下调到 4.4。
