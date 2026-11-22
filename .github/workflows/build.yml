@@ -1,18 +1,32 @@
-name: Build BakaSU (ReSukiSU) + SUSFS 2.3.0 Kernel (OPPO A32/A53 · sm4250 · non-GKI 4.19)
+name: Build SukiSU-Nova Kernel (OPPO A32/A53 · sm4250 · non-GKI 4.19)
 
 # 说明：
-#   云端编译 OPPO sm4250 (Bengal) Android 12 内核源码 + BakaSU(原 ReSukiSU) v4.2.0-rc3
-#   + 手工移植的 SUSFS 2.3.0（CONFIG_KSU_SUSFS 内联 hook 模式），产出 Image.gz。
-#   内核源码与 defconfig 均为官方 OPPO 源：分支 oppo/sm4250_s_12.1_f19
-#   本仓库只做「拉源码 → 集成 BakaSU → 打 SUSFS 补丁 → 追加配置 → 编译 → 上传 artifact」。
+#   云端编译 OPPO sm4250 (Bengal) Android 12 内核源码 + SukiSU-Nova（KernelSU 衍生版），
+#   产出 Image.gz。内核源码与配置基线均为官方 OPPO 源：分支 oppo/sm4250_s_12.1
+#   本仓库只做「拉源码 → 打 SUSFS 2.4.0 补丁 → 装 KSU 内联 hook → 集成 SukiSU-Nova(builtin-new)
+#   → 追加配置 → 编译 → 上传 artifact」。
+#
+#   为什么用 Nova 的 builtin-new 分支：
+#     * main / v3.0.0：使用 5.9+ 才有的 SELinux 内部结构（struct selinux_policy 等）
+#       与 5.8+ 的 copy_from_user_nofault，4.19 上无法编译。
+#     * builtin：只实现了 SUSFS 2.3 时代的命令，不会调用 SUSFS 2.4 新增的
+#       sus_type / sus_avd / sus_path_uid_filter / priority_uid_filter 接口。
+#     * builtin-new：专为 4.19 维护，rules.c 带 <5.10 的 selinux_state.ss->policydb 分支，
+#       supercall/sepolicy 完整支持 SUSFS v2.4 命令；KPM 只是被 kernel_compat.h 里的
+#       版本门槛挡在 5.10+（KPM 源码本身在 4.19 可用，本流程把这个门槛下调到 4.4）。
+#
+#   SUSFS 2.4.0 的 4.19 移植来自 JackA1ltman/NonGKI_Kernel_Build_2nd
+#   （patches/50_add_susfs_in_kernel-4.19-2.4.0.patch，仅补了 2 处与本机源码的上下文差异），
+#   内联 hook（fs/exec.c、fs/open.c、fs/stat.c、kernel/reboot.c …）用同仓库的
+#   susfs_inline_hook_patches.sh 安装。
 
 on:
   workflow_dispatch:
     inputs:
-      bakasu_ref:
-        description: "BakaSU(ReSukiSU) 版本 (4.19 非 GKI 请保持 v4.2.0-rc3)"
+      ksu_ref:
+        description: "SukiSU-Nova 分支（4.19 + SUSFS2.4.0 + KPM 必须用 builtin-new）"
         required: true
-        default: "v4.2.0-rc3"
+        default: "builtin-new"
   push:
     branches: [ main ]
 
@@ -22,12 +36,13 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 240
+    timeout-minutes: 300
 
     env:
       KSRC: kernel/msm-4.19                      # 内核源码工作目录
       OUT: ${{ github.workspace }}/out           # 编译输出目录
-      KSU_REF: ${{ inputs.bakasu_ref || 'v4.2.0-rc3' }}
+      KSU_REF: ${{ inputs.ksu_ref || 'builtin-new' }}
+      KSU_REPO: https://github.com/SukiSU-Nova/SukiSU-Nova.git
       KBRANCH: oppo/sm4250_s_12.1              # 出厂 C12 内核对应的源码分支（_f19 分支缺少部分出厂驱动）
       CLANG_DIR: ${{ github.workspace }}/tc/clang
       GCC64_DIR: ${{ github.workspace }}/tc/gcc64
@@ -74,7 +89,6 @@ jobs:
           try_clone tc/gcc32 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git lineage-19.1 \
             || { echo "::error::无法获取 arm gcc 4.9 工具链"; exit 1; }
           echo "--- clang ---"; tc/clang/bin/clang --version | head -n 3
-          echo "--- gcc64 ---"; ls tc/gcc64/bin | head -n 6
 
       - name: Clone OPPO kernel sources
         run: |
@@ -90,22 +104,134 @@ jobs:
           rm -rf /tmp/oplus-extra
           echo "--- kernel version ---"
           head -n 5 "$KSRC/Makefile"
+          git -C "$KSRC" log -1 --format='%H %ci %s' || true
 
-      - name: Integrate BakaSU (ReSukiSU) kernel driver
+      - name: Apply SUSFS v2.4.0 kernel patch (4.19 port)
         run: |
           set -e
-          # 完整历史克隆（blob 按需拉取，避免 --depth=1 触发 Kbuild 里的 unshallow，
-          # 同时保证 KSU_VERSION 计算与 git describe 拿到真实 tag）
-          rm -rf "$KSRC/KernelSU"
-          git clone --filter=blob:none https://github.com/ReSukiSU/ReSukiSU.git "$KSRC/KernelSU"
-          git -C "$KSRC/KernelSU" checkout "$KSU_REF"
+          cd "$KSRC"
+          PATCH="$GITHUB_WORKSPACE/patches/50_add_susfs_in_kernel-4.19-2.4.0.patch"
+          test -f "$PATCH" || { echo "::error::缺少 SUSFS 2.4.0 补丁: $PATCH"; exit 1; }
+          # --fuzz=3：OPPO 出厂源码与上游 4.19 有少量上下文差异（已按本机源码校正过 2 处）
+          patch -p1 --fuzz=3 --forward < "$PATCH" | tee /tmp/susfs_patch.log || true
+          REJ=$(find . -name '*.rej' | sort)
+          if [ -n "$REJ" ]; then
+            echo "::error::SUSFS 2.4.0 补丁存在无法应用的 hunk"
+            for r in $REJ; do echo "=== $r ==="; sed -n '1,60p' "$r"; done
+            exit 1
+          fi
+          echo "--- SUSFS patch applied ---"
+          test -f fs/susfs.c             || { echo "::error::未生成 fs/susfs.c"; exit 1; }
+          test -f include/linux/susfs.h  || { echo "::error::未生成 include/linux/susfs.h"; exit 1; }
+          grep -E '^#define SUSFS_VERSION' include/linux/susfs.h
+          grep -q '#define SUSFS_VERSION "v2.4.0"' include/linux/susfs.h \
+            || { echo "::error::SUSFS 版本不是 v2.4.0"; exit 1; }
+          for sym in susfs_add_sus_type susfs_add_sus_avd_allowed_by_type \
+                     susfs_set_sus_path_uid_filter susfs_set_priority_uid_filter \
+                     susfs_parse_sus_path_app_strings susfs_set_avc_log_spoofing; do
+            grep -q "$sym" fs/susfs.c || { echo "::error::SUSFS 2.4 接口缺失: $sym"; exit 1; }
+          done
+          grep -q 'CMD_SUSFS_SET_SUS_PATH_UID_FILTER' include/linux/susfs_def.h \
+            || { echo "::error::缺少 CMD_SUSFS_SET_SUS_PATH_UID_FILTER"; exit 1; }
+          grep -n 'susfs' fs/Makefile
+
+      - name: Install SUSFS / KSU inline hooks
+        run: |
+          set -e
+          cd "$KSRC"
+          bash "$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh" | tee /tmp/hook.log
+          echo "--- hook log 摘要 ---"
+          grep -E '\[\+\]|\[-\]' /tmp/hook.log | head -n 80 || true
+
+          # 4.19 走 CONFIG_KSU_LSM_SECURITY_HOOKS（lsm_hooks_list.c），
+          # ksu_hide_setprocattr 由该文件里的 inline 版本完成；
+          # manual 版本（lsm_hooks_manual.c）不参与编译，所以这里必须去掉
+          # selinux/hooks.c 里对 ksu_hide_setprocattr 的调用，否则链接期 undefined。
+          sed -i '/ksu_hide_setprocattr/d' security/selinux/hooks.c
+
+          # open.c / stat.c 在 patch 时 namei.c 还是 static，脚本可能漏掉 filename_lookup 的声明；
+          # 这里补一个显式 extern，避免隐式声明（-Werror 环境下会直接失败）。
+          python3 - <<'PY'
+          import io
+          decl = ('extern int filename_lookup(int dfd, struct filename *name, unsigned flags,\n'
+                  '\t\t\t   struct path *path, struct path *root);\n')
+          for p in ('fs/open.c', 'fs/stat.c'):
+              s = open(p, encoding='utf-8').read()
+              if 'filename_lookup(' not in s:
+                  continue
+              if 'extern int filename_lookup' in s:
+                  continue
+              marker = '#include <linux/susfs_def.h>\n'
+              idx = s.find(marker)
+              assert idx != -1, p
+              idx += len(marker)
+              # 跳过可能紧跟的 #endif 行
+              tail = s[idx:]
+              lines = tail.split('\n')
+              off = 0
+              if lines and lines[0].startswith('#endif'):
+                  off = len(lines[0]) + 1
+              s = s[:idx + off] + decl + s[idx + off:]
+              open(p, 'w', encoding='utf-8').write(s)
+              print('added extern filename_lookup to', p)
+          PY
+
+          echo "--- 校验 hook 是否全部落地 ---"
+          for sym in ksu_handle_execveat ksu_handle_execveat_sucompat ksu_handle_post_execveat_sucompat \
+                     ksu_handle_faccessat ksu_handle_stat ksu_handle_vfs_fstat ksu_handle_setresuid \
+                     ksu_handle_input_handle_event ksu_handle_sys_read ksu_handle_sys_reboot; do
+            c=$(grep -R --include='*.c' -h "$sym" fs kernel drivers security 2>/dev/null | wc -l)
+            echo "$sym -> $c"
+            [ "$c" -gt 0 ] || { echo "::error::inline hook $sym 未安装"; exit 1; }
+          done
+          grep -q 'ksu_hide_setprocattr' security/selinux/hooks.c \
+            && { echo "::error::ksu_hide_setprocattr 仍残留在 hooks.c"; exit 1; } || true
+          echo "--- selinux hooks.c: setprocattr / bprm ---"
+          grep -n 'ksu_sid\|secdata\|check_nnp_nosuid\|selinux_setprocattr' security/selinux/hooks.c | head -n 20 || true
+
+      - name: Integrate SukiSU-Nova kernel driver (builtin-new)
+        run: |
+          set -e
+          # 完整历史克隆（blob 按需拉取；Makefile 里会用 git/curl 计算版本号）
+          rm -rf "$KSRC/SukiSU-Nova"
+          git clone --filter=blob:none "$KSU_REPO" "$KSRC/SukiSU-Nova"
+          git -C "$KSRC/SukiSU-Nova" checkout "$KSU_REF"
+          echo "--- checked out ---"
+          git -C "$KSRC/SukiSU-Nova" log -1 --oneline
 
           cd "$KSRC"
-          # BakaSU 的内核驱动在仓库 kernel/ 目录；drivers/kernelsu 指向它
-          #   注意：相对路径是 ../KernelSU/kernel（KernelSU 已克隆到 $KSRC 里面）
+          echo "$KSU_REF" | grep -qx 'builtin-new' \
+            || { echo "::error::本流程只支持 builtin-new（当前 $KSU_REF）"; exit 1; }
+
+          # builtin-new 的 kernel/ 目录只带 Makefile（没有 Kbuild）。
+          # kbuild 在目录内没有 Kbuild 时会自动回退读取 Makefile，所以这里必须保留 Makefile。
           rm -rf drivers/kernelsu
-          ln -sfn ../KernelSU/kernel drivers/kernelsu
-          test -f drivers/kernelsu/Kconfig || { echo "::error::drivers/kernelsu 软链无效"; exit 1; }
+          mkdir -p drivers/kernelsu
+          cp -a SukiSU-Nova/kernel/. drivers/kernelsu/
+          for f in Makefile Kconfig kernel_compat.h ksu.c kernel_includes.h \
+                   hook/lsm_hooks_list.c extension/kpm/kpm.c extension/kpm/compact.c \
+                   manager/apk_sign.c; do
+            test -f "drivers/kernelsu/$f" || { echo "::error::drivers/kernelsu/$f 缺失（不是 builtin-new 分支？）"; exit 1; }
+          done
+          grep -q '^obj-\$(CONFIG_KSU) := kernelsu.o' drivers/kernelsu/Makefile \
+            || { echo "::error::Makefile 不是 builtin-new 版本"; exit 1; }
+          grep -q 'config KSU_SUSFS' drivers/kernelsu/Kconfig \
+            || { echo "::error::Kconfig 缺少 KSU_SUSFS"; exit 1; }
+          grep -q '947ae944f3de4ed4c21a7e4f7953ecf351bfa2b36239da37a34111ad29993eef' drivers/kernelsu/manager/apk_sign.c \
+            || { echo "::error::apk_sign.c 未内置 Nova 管理器签名"; exit 1; }
+
+          # KPM 源码本身兼容 4.19（access_ok/thread_pid 都按版本处理），
+          # 只是 kernel_compat.h 把可用门槛写死成 5.10+，这里下调到 4.4。
+          python3 - <<'PY'
+          p = 'drivers/kernelsu/kernel_compat.h'
+          s = open(p, encoding='utf-8').read()
+          old = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n#define KSU_CAN_USE_KPM'
+          new = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)\n#define KSU_CAN_USE_KPM'
+          assert old in s, 'KSU_CAN_USE_KPM gate not found'
+          open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+          print('KSU_CAN_USE_KPM gate -> 4.4')
+          PY
+          grep -n -A1 'KSU_CAN_USE_KPM' drivers/kernelsu/kernel_compat.h | head -n 6
 
           # drivers/Makefile
           grep -q 'kernelsu/' drivers/Makefile \
@@ -123,51 +249,16 @@ jobs:
           PY
 
           echo "--- integration check ---"
-          ls -ld drivers/kernelsu
+          ls drivers/kernelsu | head -n 20
           tail -n 2 drivers/Makefile
           grep -n 'kernelsu' drivers/Kconfig
-          git -C KernelSU describe --abbrev=0 --tags || true
 
-      - name: Apply SUSFS 2.3.0 kernel patch (4.19 backport)
-        run: |
-          set -e
-          PATCH="$GITHUB_WORKSPACE/patches/50_add_susfs_in_kernel-4.19-2.3.0.patch"
-          ls -l "$PATCH"
-          cd "$KSRC"
-          if git apply --check "$PATCH"; then
-            git apply --whitespace=nowarn "$PATCH"
-            echo "git apply 成功"
-          elif patch -p1 --forward --fuzz=3 --dry-run < "$PATCH"; then
-            echo "git apply 失败，回退到 patch(1)（fuzz=3）"
-            patch -p1 --forward --fuzz=3 < "$PATCH"
-          else
-            echo "::error::SUSFS 补丁在分支 $KBRANCH 上无法干净应用，下面是失败上下文"
-            patch -p1 --forward --fuzz=3 < "$PATCH" || true
-            for f in $(find . -name '*.rej' | head -n 8); do
-              echo "=============== $f ==============="
-              head -n 60 "$f"
-            done
-            exit 1
-          fi
-          echo "--- susfs files ---"
-          ls -l fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
-          grep -n 'susfs.o' fs/Makefile
-          echo "--- inline hook check (与 inline_hook_check.mk 一致) ---"
-          grep -q 'ksu_handle_setresuid' kernel/sys.c
-          grep -q 'ksu_handle_execveat' fs/exec.c
-          grep -q 'ksu_handle_faccessat' fs/open.c
-          grep -q 'ksu_handle_sys_read' fs/read_write.c
-          grep -q 'ksu_handle_stat' fs/stat.c
-          grep -q 'ksu_handle_sys_reboot' kernel/reboot.c
-          grep -q 'ksu_handle_input_handle_event' drivers/input/input.c
-          ! grep -rqE '\bksu_(vfs_read_hook|input_hook|execveat_hook|init_rc_hook)\b' fs kernel drivers || {
-            echo "::error::发现旧式 KSU hook 符号"; exit 1; }
-
-      - name: Add 4.19 header shims for BakaSU
+      - name: Add 4.19 header shims (compat safety net)
         run: |
           set -e
           cd "$KSRC"
-          # 4.19 没有 5.4+/5.6+ 才引入的这几个头，BakaSU 里是无条件 include 的
+          # 4.19 没有 5.x 才引入的这几个头，新版驱动里可能无条件 include；
+          # 缺失时补一个转发 shim，已存在则跳过（纯增量，不改动原厂头文件）
           make_shim() {   # $1=头文件名 $2=转发目标 $3=include guard
             local name="$1" target="$2" guard="$3"
             if [ -f "include/linux/$name" ]; then
@@ -183,19 +274,26 @@ jobs:
             } > "include/linux/$name"
             echo "已生成 include/linux/$name -> $target"
           }
-          make_shim pgtable.h   '<asm/pgtable.h>'   _LINUX_PGTABLE_COMPAT_H
-          make_shim minmax.h    '<linux/kernel.h>'  _LINUX_MINMAX_COMPAT_H
-          make_shim hex.h       '<linux/kernel.h>'  _LINUX_HEX_COMPAT_H
-          make_shim unaligned.h '<asm/unaligned.h>' _LINUX_UNALIGNED_COMPAT_H
+          # KPM (extension/kpm) 会无条件 include <linux/set_memory.h>（5.0 才有），
+          # 但实际并未调用 set_memory_*，所以补一个空头即可（arm64 4.19 没有 asm/set_memory.h）
+          if [ ! -f include/linux/set_memory.h ]; then
+            printf '/* 4.19 compat shim (CI 自动生成) */\n#ifndef _LINUX_SET_MEMORY_COMPAT_H\n#define _LINUX_SET_MEMORY_COMPAT_H\n#endif\n' \
+              > include/linux/set_memory.h
+            echo "已生成 include/linux/set_memory.h（空头，4.19 未使用 set_memory_*）"
+          fi
+          make_shim pgtable.h     '<asm/pgtable.h>'     _LINUX_PGTABLE_COMPAT_H
+          make_shim minmax.h      '<linux/kernel.h>'    _LINUX_MINMAX_COMPAT_H
+          make_shim hex.h         '<linux/kernel.h>'    _LINUX_HEX_COMPAT_H
+          make_shim unaligned.h   '<asm/unaligned.h>'   _LINUX_UNALIGNED_COMPAT_H
 
       # ------------------------------------------------------------------
       # 关键：以「原厂 .config」为唯一基线
       #   原因：CONFIG_MODVERSIONS=y 时，内核每个导出符号的 CRC 由「源码 + 配置」
-      #   共同决定。上一版用 bengal-perf_defconfig + 大量关闭调试/OPPO 特性，
-      #   改变了 struct 布局（如 CONFIG_SCHEDSTATS 影响 struct task_struct），
-      #   导致 __kcrctab 与原厂大面积不符 → vendor 的 qca_cld3_wlan.ko 因
+      #   共同决定。用 bengal-perf_defconfig + 大量关闭调试/OPPO 特性，会改变
+      #   struct 布局（如 CONFIG_SCHEDSTATS 影响 struct task_struct），导致
+      #   __kcrctab 与原厂大面积不符 → vendor 的 qca_cld3_wlan.ko 因
       #   "disagrees about version of symbol" 拒载 → WiFi 打不开。
-      #   现在只在这份原厂配置上追加 KSU/SUSFS 必需项，其余一律不动。
+      #   现在只在这份原厂配置上追加 KSU 必需项，其余一律不动。
       # ------------------------------------------------------------------
       - name: Install factory (stock) kernel config
         run: |
@@ -206,20 +304,26 @@ jobs:
           cp "$CFG" "$OUT/.config"
           cp "$CFG" "$OUT/.config.baseline"
           echo "原厂配置行数: $(wc -l < "$OUT/.config")"
-          grep -E '^CONFIG_(LOCALVERSION|MODVERSIONS|MODULE_SIG_FORCE|WLAN|CFG80211|ICNSS|CNSS_GENL|WCNSS_MEM_PRE_ALLOC)=' "$OUT/.config" || true
+          grep -E '^CONFIG_(LOCALVERSION|MODVERSIONS|MODULE_SIG_FORCE|THREAD_INFO_IN_TASK|WLAN|CFG80211|ICNSS|CNSS_GENL|CRYPTO_SHA256|OVERLAY_FS)=' "$OUT/.config" || true
 
-      - name: Append BakaSU / SUSFS config on factory baseline
+      - name: Append SukiSU-Nova (builtin-new + SUSFS 2.4.0 + KPM) config
         env:
           FRAGMENT: |
             # ==================================================================
-            # 仅追加 BakaSU + SUSFS 必需项；其余全部沿用原厂 .config
+            # 仅追加 SukiSU-Nova (builtin-new) + SUSFS 2.4.0 + KPM 必需项；
+            # 其余全部沿用原厂 .config
             # ==================================================================
             CONFIG_KSU=y
-            CONFIG_KSU_SUSFS=y
-            CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
-            CONFIG_KALLSYMS=y
-            CONFIG_KALLSYMS_ALL=y
+            CONFIG_KSU_FEATURE_ADBROOT=y
+            CONFIG_KSU_DEBUG=n
+            CONFIG_KSU_LSM_SECURITY_HOOKS=y
+            # SUSFS 模式下不能同时启用 branch link / syscall table 两套 hook
+            # CONFIG_KSU_HACK_ARM64_BRANCH_LINK is not set
+            # CONFIG_KSU_TAMPER_SYSCALL_TABLE is not set
 
+            # ---- SUSFS 2.4.0（由上面打的内核补丁 + inline hook 提供实现）----
+            CONFIG_KSU_SUSFS=y
+            CONFIG_KSU_SUSFS_INLINE_HOOK=y
             CONFIG_KSU_SUSFS_SUS_PATH=y
             CONFIG_KSU_SUSFS_SUS_MOUNT=y
             CONFIG_KSU_SUSFS_SUS_KSTAT=y
@@ -229,6 +333,15 @@ jobs:
             CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
             CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             CONFIG_KSU_SUSFS_SUS_MAP=y
+            CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
+
+            # ---- KPM（门槛已下调到 Linux >= 4.4）----
+            CONFIG_KPM=y
+
+            # KSU/KPM 依赖（原厂已开，显式保留）
+            CONFIG_THREAD_INFO_IN_TASK=y
+            CONFIG_KALLSYMS=y
+            CONFIG_KALLSYMS_ALL=y
 
             # 原厂是强制签名(MODULE_SIG_FORCE=y)：自编内核没有 OPPO 私钥，
             # 必须关掉强制校验，否则 vendor 分区所有 .ko 都会被拒载。
@@ -241,7 +354,7 @@ jobs:
           set -e
           printf '\n%s\n' "$FRAGMENT" >> "$OUT/.config"
           echo "--- appended tail ---"
-          tail -n 22 "$OUT/.config"
+          tail -n 34 "$OUT/.config"
 
       - name: Configure kernel
         run: |
@@ -254,18 +367,22 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-androideabi-
           )
           make "${MAKE_ARGS[@]}" olddefconfig
-          echo "--- 与原厂配置的差异（正常应只剩 KSU/SUSFS + MODULE_SIG_FORCE + DEBUG_INFO）---"
+          echo "--- 与原厂配置的差异（正常应只剩 KSU/SUSFS/KPM + MODULE_SIG_FORCE + DEBUG_INFO）---"
           diff -u "$OUT/.config.baseline" "$OUT/.config" > "$OUT/config_diff.txt" || true
           echo "差异行数: $(wc -l < "$OUT/config_diff.txt")"
           grep -E '^[+-]CONFIG_' "$OUT/config_diff.txt" | head -n 120 || true
           echo "--- key configs ---"
-          grep -E '^CONFIG_(KSU|KSU_SUSFS|THREAD_INFO_IN_TASK|OVERLAY_FS|KALLSYMS|KALLSYMS_ALL|EXT4_FS|MODVERSIONS|MODULE_SIG_FORCE|DEBUG_INFO|WLAN|CFG80211|ICNSS|CNSS_GENL)=' "$OUT/.config" || true
-          grep -q '^CONFIG_KSU=y'              "$OUT/.config" || { echo "::error::CONFIG_KSU 未生效，BakaSU 集成失败"; exit 1; }
-          grep -q '^CONFIG_KSU_SUSFS=y'        "$OUT/.config" || { echo "::error::CONFIG_KSU_SUSFS 未生效（需 THREAD_INFO_IN_TASK && 64BIT）"; exit 1; }
-          grep -q '^CONFIG_THREAD_INFO_IN_TASK=y' "$OUT/.config" || { echo "::error::THREAD_INFO_IN_TASK 未开启，SUSFS 无法编译"; exit 1; }
-          grep -q '^CONFIG_KALLSYMS_ALL=y'     "$OUT/.config" || { echo "::error::CONFIG_KALLSYMS_ALL 未生效"; exit 1; }
-          grep -q '^CONFIG_OVERLAY_FS=y'       "$OUT/.config" || { echo "::error::CONFIG_OVERLAY_FS 未生效，KSU 依赖它"; exit 1; }
-          grep -q '^CONFIG_EXT4_FS=y'          "$OUT/.config" || { echo "::error::CONFIG_EXT4_FS 未生效"; exit 1; }
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|KSU_SUSFS_[A-Z_]+|KSU_LSM_SECURITY_HOOKS|KSU_FEATURE_ADBROOT|KPM|KALLSYMS|KALLSYMS_ALL|THREAD_INFO_IN_TASK|SECURITY_SELINUX|SECCOMP|OVERLAY_FS|EXT4_FS|MODVERSIONS|MODULE_SIG_FORCE|DEBUG_INFO|WLAN|CFG80211|ICNSS|CNSS_GENL|CRYPTO_SHA256)=' "$OUT/.config" || true
+          grep -q '^CONFIG_KSU=y'                        "$OUT/.config" || { echo "::error::CONFIG_KSU 未生效，Nova 集成失败"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y'                  "$OUT/.config" || { echo "::error::CONFIG_KSU_SUSFS 未生效"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS_INLINE_HOOK=y'      "$OUT/.config" || { echo "::error::CONFIG_KSU_SUSFS_INLINE_HOOK 未生效"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y' "$OUT/.config" || { echo "::error::CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER 未生效"; exit 1; }
+          grep -q '^CONFIG_KPM=y'                        "$OUT/.config" || { echo "::error::CONFIG_KPM 未生效"; exit 1; }
+          grep -q '^CONFIG_KALLSYMS_ALL=y'               "$OUT/.config" || { echo "::error::CONFIG_KALLSYMS_ALL 未生效"; exit 1; }
+          grep -q '^CONFIG_THREAD_INFO_IN_TASK=y'        "$OUT/.config" || { echo "::error::CONFIG_THREAD_INFO_IN_TASK 未生效，SUSFS 依赖它"; exit 1; }
+          grep -q '^CONFIG_SECURITY_SELINUX=y'           "$OUT/.config" || { echo "::error::CONFIG_SECURITY_SELINUX 未生效，KSU 依赖它"; exit 1; }
+          grep -q '^CONFIG_OVERLAY_FS=y'                 "$OUT/.config" || { echo "::error::CONFIG_OVERLAY_FS 未生效，KSU 依赖它"; exit 1; }
+          grep -q '^CONFIG_EXT4_FS=y'                    "$OUT/.config" || { echo "::error::CONFIG_EXT4_FS 未生效"; exit 1; }
           # WiFi 依赖的原厂配置不得被改动
           grep -q '^CONFIG_WLAN=y'             "$OUT/.config" || { echo "::error::CONFIG_WLAN 被改动，vendor wlan.ko 无法加载"; exit 1; }
           grep -q '^CONFIG_CFG80211=y'         "$OUT/.config" || { echo "::error::CONFIG_CFG80211 被改动，vendor wlan.ko 无法加载"; exit 1; }
@@ -275,23 +392,34 @@ jobs:
 
       - name: Build Image.gz
         run: |
-          set -e
+          set -o pipefail
           export PATH="$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
+          # -k：一次编译尽量跑完，把所有报错一次性暴露出来（便于一轮修完）
           make -C "$KSRC" O="$OUT" ARCH=arm64 \
             CC=clang CLANG_TRIPLE=aarch64-linux-gnu- REAL_CC="$CLANG_DIR/bin/clang" \
             CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            -j"$(nproc)" Image.gz
+            -k -j"$(nproc)" Image.gz 2>&1 | tee /tmp/build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ] || [ ! -f "$OUT/arch/arm64/boot/Image.gz" ]; then
+            echo "::error::编译失败（exit=$status），下面汇总错误行："
+            grep -nE 'error:|Error [0-9]+|undefined reference|No rule to make' /tmp/build.log | head -n 300 || true
+            exit 1
+          fi
           echo "--- artifacts ---"
           ls -l "$OUT/arch/arm64/boot/Image.gz" "$OUT/vmlinux" "$OUT/System.map"
           echo "--- kernel release ---"
           strings "$OUT/vmlinux" | grep -m1 'Linux version' || true
           echo "--- vermagic (必须与原厂一致: 4.19.152-perf+ SMP preempt mod_unload modversions aarch64) ---"
           strings "$OUT/vmlinux" | grep -m1 '^4\.19\.152-perf+' || true
+          echo "--- SukiSU-Nova / SUSFS 编译摘要 ---"
+          grep -E '^(-- .*(version|Manager|KERNEL_|KPM|using|SUSFS_VERSION))|KernelSU/compat|drivers/kernelsu' /tmp/build.log | head -n 60 || true
+          echo "--- 关键符号确认 ---"
+          grep -E 'susfs_set_sus_path_uid_filter|susfs_add_sus_type|ksu_handle_execveat|ksu_handle_sys_read' "$OUT/System.map" | head -n 20 || true
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bakasu-susfs230-kernel-${{ env.KSU_REF }}
+          name: sukisu-nova-builtinnew-susfs240-kpm-${{ env.KSU_REF }}
           path: |
             out/arch/arm64/boot/Image.gz
             out/vmlinux
