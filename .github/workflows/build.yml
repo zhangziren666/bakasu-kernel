@@ -290,36 +290,95 @@ jobs:
           PY
           grep -n -A1 'KSU_CAN_USE_KPM' drivers/kernelsu/kernel_compat.h | head -n 6
 
-          # 管理器 UID 只有在 track_throne() 跑过之后才会被 crown。
-          # 正常路径是 ksud 上报 EVENT_BOOT_COMPLETED 或 packages.list 被重写
-          # （安装/更新应用）时触发；如果本机没有可用的 ksud，开机后就没有
-          # 任何触发点，管理器永远拿不到 fd。这里在 init 后 60s 主动补一次扫描，
-          # 让「重启后管理器不被识别」不再依赖 ksud。
+          # 1) 开机主动 crown 管理器（不依赖 ksud），失败则每 30s 重试，最多 10 次
+          # 2) 暴露 /proc/ksu_diag，方便在没有 dmesg 权限时看内核侧状态
+          # 3) setuid hook 里加计数器 + 管理器快捷路径（不依赖 zygote SID 判定）
           python3 - <<'PY'
           p = 'drivers/kernelsu/ksu.c'
           s = open(p, encoding='utf-8').read()
-          if 'ksu_boot_throne_workfn' in s:
-              print('ksu.c 已有 boot throne 扫描，跳过')
+          if 'ksu_diag_hits' in s:
+              print('ksu.c 已有 diag，跳过')
           else:
+              early = '#include "kernel_includes.h"'
+              assert early in s, 'ksu.c: kernel_includes anchor not found'
+              s = s.replace(early, early + '\n\n/* KSU diag counters (temporary) */\n'
+                                          'unsigned long ksu_diag_hits;\n'
+                                          'unsigned long ksu_diag_installs;', 1)
+
               anchor = 'static char *spoof_version = NULL;'
               assert anchor in s, 'ksu.c: spoof_version anchor not found'
-              block = ('#include <linux/jiffies.h>\n'
-                       'static void ksu_boot_throne_workfn(struct work_struct *work)\n'
-                       '{\n'
-                       '\ttrack_throne(false);\n'
-                       '}\n'
-                       'static DECLARE_DELAYED_WORK(ksu_boot_throne_work, ksu_boot_throne_workfn);\n\n')
+              block = (
+                  '#include <linux/jiffies.h>\n'
+                  '#include <linux/proc_fs.h>\n'
+                  '#include <linux/seq_file.h>\n\n'
+                  'static int ksu_diag_show(struct seq_file *m, void *v)\n'
+                  '{\n'
+                  '\tseq_printf(m, "manager_appid=%d valid=%d\\n", (int)ksu_manager_appid,\n'
+                  '\t\t   ksu_is_manager_appid_valid() ? 1 : 0);\n'
+                  '\tseq_printf(m, "setresuid_hits=%lu fd_installs=%lu\\n",\n'
+                  '\t\t   ksu_diag_hits, ksu_diag_installs);\n'
+                  '\treturn 0;\n'
+                  '}\n\n'
+                  'static int ksu_diag_open(struct inode *inode, struct file *file)\n'
+                  '{\n'
+                  '\treturn single_open(file, ksu_diag_show, NULL);\n'
+                  '}\n\n'
+                  'static const struct file_operations ksu_diag_fops = {\n'
+                  '\t.open = ksu_diag_open,\n'
+                  '\t.read = seq_read,\n'
+                  '\t.llseek = seq_lseek,\n'
+                  '\t.release = single_release,\n'
+                  '};\n\n'
+                  'static struct delayed_work ksu_boot_throne_work;\n'
+                  'static void ksu_boot_throne_workfn(struct work_struct *work)\n'
+                  '{\n'
+                  '\tstatic int tries;\n'
+                  '\ttrack_throne(false);\n'
+                  '\tif (!ksu_is_manager_appid_valid() && ++tries < 10)\n'
+                  '\t\tschedule_delayed_work(&ksu_boot_throne_work,\n'
+                  '\t\t\t\t      msecs_to_jiffies(30000));\n'
+                  '}\n\n')
               s = s.replace(anchor, block + anchor, 1)
+
               ret = '\tksu_lsm_hook_init();\n\treturn 0;'
               assert ret in s, 'ksu.c: kernelsu_init return anchor not found'
               sched = ('\tksu_lsm_hook_init();\n'
-                       '\tschedule_delayed_work(&ksu_boot_throne_work, msecs_to_jiffies(60000));\n'
+                       '\tINIT_DELAYED_WORK(&ksu_boot_throne_work, ksu_boot_throne_workfn);\n'
+                       '\tproc_create("ksu_diag", 0444, NULL, &ksu_diag_fops);\n'
+                       '\tschedule_delayed_work(&ksu_boot_throne_work, msecs_to_jiffies(45000));\n'
                        '\treturn 0;')
               s = s.replace(ret, sched, 1)
               open(p, 'w', encoding='utf-8').write(s)
-              print('已在 ksu.c 注入开机 60s throne 扫描')
+              print('ksu.c: diag + throne retry injected')
+
+          p = 'drivers/kernelsu/hook/setuid_hook.c'
+          s = open(p, encoding='utf-8').read()
+          if 'ksu_diag_hits' in s:
+              print('setuid_hook.c 已有 diag，跳过')
+          else:
+              s = s.replace('ksu_install_fd();',
+                            'do { ksu_install_fd(); ksu_diag_installs++; } while (0);')
+              anchor = ('int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)\n'
+                        '{\n'
+                        '\tuid_t cur_uid = current_uid().val;')
+              assert anchor in s, 'setuid_hook.c: ksu_handle_setresuid anchor not found'
+              shortcut = ('int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)\n'
+                          '{\n'
+                          '\tuid_t cur_uid = current_uid().val;\n'
+                          '\n'
+                          '\tksu_diag_hits++;\n'
+                          '\tif (likely(ksu_is_manager_appid_valid()) && unlikely(is_uid_manager(ruid))) {\n'
+                          '\t\tdisable_seccomp();\n'
+                          '\t\tpr_info("ksu: manager fd shortcut %d\\n", ruid);\n'
+                          '\t\tksu_install_fd();\n'
+                          '\t\tksu_diag_installs++;\n'
+                          '\t\treturn 0;\n'
+                          '\t}')
+              s = s.replace(anchor, shortcut, 1)
+              open(p, 'w', encoding='utf-8').write(s)
+              print('setuid_hook.c: diag + manager shortcut injected')
           PY
-          grep -n 'ksu_boot_throne_work' drivers/kernelsu/ksu.c
+          grep -n 'ksu_diag' drivers/kernelsu/ksu.c drivers/kernelsu/hook/setuid_hook.c | head -n 12
 
           # drivers/Makefile
           grep -q 'kernelsu/' drivers/Makefile \
